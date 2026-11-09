@@ -1,0 +1,19 @@
+# 依赖与构建产物
+extension-src/node_modules/
+extension-src/dist/
+extension-src/release/
+*.tsbuildinfo
+
+# Python 缓存（diagnostics 脚本）
+__pycache__/
+*.py[cod]
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
+
+# 临时文件
+tmp/

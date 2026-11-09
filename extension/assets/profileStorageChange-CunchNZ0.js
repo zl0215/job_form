@@ -1,0 +1,1 @@
+function e(e,t){return t===`local`&&`resumeProfileLibrary`in e}export{e as t};
