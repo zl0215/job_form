@@ -4,6 +4,13 @@ import type {
   MessageResponse,
   PageFieldReport,
   PageFrameFieldReport,
+  PanelFillSelectedPayload,
+  PanelFillSummary,
+  PanelFrameFillResult,
+  PanelFrameScan,
+  PanelFrameUndoResult,
+  PanelScanResult,
+  PanelUndoResult,
   SaveFieldAliasResult,
   UserProfile,
   ParsedResumeData,
@@ -177,6 +184,28 @@ export async function handleMessage(
 
     case 'SAVE_FIELD_ALIAS':
       return await handleSaveFieldAlias(message.payload);
+
+    // v1.1 网页内悬浮面板：面板在顶层 frame，扫描/填充/撤销由 background 按 frame 路由。
+    case 'PANEL_SCAN':
+      return await handlePanelScan(message.payload, sender);
+
+    case 'PANEL_FILL_SELECTED':
+      return await handlePanelFillSelected(message.payload, sender);
+
+    case 'PANEL_UNDO':
+      return await handlePanelUndo(sender);
+
+    case 'PANEL_OPEN_OPTIONS':
+      try {
+        await chrome.runtime.openOptionsPage();
+        return { success: true };
+      } catch (error) {
+        console.warn('打开设置页失败:', error);
+        return { success: false, error: '打开设置页失败，请从扩展管理页进入选项' };
+      }
+
+    case 'PANEL_OPEN_POPUP':
+      return await handleOpenPopupTab();
 
     case 'CREATE_APPLICATION_RECORD_DRAFT':
       return await handleCreateApplicationRecordDraft(message.payload.tabId);
@@ -405,6 +434,438 @@ async function handleGetPageFieldReport(
       error: error instanceof Error ? error.message : '读取本页字段失败',
     };
   }
+}
+
+// —— v1.1 网页内悬浮面板：background 按 frame 路由 扫描 / 选择性填充 / 撤销 ——
+// 面板只在顶层 frame；字段 id 统一为 `frame-<frameId>:<localId>`，由 background 拆回各 frame。
+
+const PANEL_FIELD_ID_PATTERN = /^frame-(\d+):(.+)$/;
+const PANEL_MAX_SELECTED_FIELDS = 300;
+
+function buildPanelFieldId(frameId: number, localId: string): string {
+  return `frame-${frameId}:${localId}`;
+}
+
+function parsePanelFieldId(fieldId: string): { frameId: number; localId: string } | null {
+  const match = PANEL_FIELD_ID_PATTERN.exec((fieldId || '').trim());
+  if (!match) return null;
+  const frameId = Number(match[1]);
+  if (!Number.isInteger(frameId) || frameId < 0) return null;
+  return { frameId, localId: match[2] };
+}
+
+/** 面板消息来自页面 content script：优先使用 sender.tab，其次按 payload/活动标签页回退。 */
+async function resolvePanelSenderTabId(
+  sender: chrome.runtime.MessageSender,
+  payload?: { tabId?: number } | null,
+): Promise<number> {
+  if (sender?.tab?.id) return sender.tab.id;
+  return resolvePageReportTabId(payload);
+}
+
+async function requestPanelFrameScan(
+  tabId: number,
+  frameId: number,
+): Promise<PanelFrameScan | null> {
+  try {
+    const response = await chrome.tabs.sendMessage(
+      tabId,
+      { type: 'PANEL_FRAME_SCAN' } satisfies Message,
+      { frameId },
+    ) as MessageResponse<PanelFrameScan> | undefined;
+    if (!response?.success || !response.data) return null;
+    const data = response.data;
+    return {
+      frameId,
+      detected: Number(data.detected) || 0,
+      blockedCount: Number(data.blockedCount) || 0,
+      fields: Array.isArray(data.fields) ? data.fields : [],
+      unmatched: Array.isArray(data.unmatched) ? data.unmatched : [],
+    };
+  } catch {
+    // 该 frame 没有 content script（受限 iframe / about:blank 等）时跳过。
+    return null;
+  }
+}
+
+async function handlePanelScan(
+  payload: { tabId?: number } | null | undefined,
+  sender: chrome.runtime.MessageSender,
+): Promise<MessageResponse<PanelScanResult>> {
+  try {
+    const tabId = await resolvePanelSenderTabId(sender, payload);
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (tab?.url && isRestrictedPage(tab.url)) {
+      return {
+        success: false,
+        error: '当前页面是浏览器内置页面或扩展商店页面，无法使用页面面板',
+      };
+    }
+
+    const frameIds = (await discoverPageReportFrameIds(tabId)).sort((a, b) => a - b);
+    const frameScans = await Promise.all(
+      frameIds.map(async frameId => requestPanelFrameScan(tabId, frameId)),
+    );
+    const available = frameScans.filter(
+      (scan): scan is PanelFrameScan => Boolean(scan),
+    );
+    if (available.length === 0) {
+      return {
+        success: false,
+        error: '无法读取当前页面字段：请确认招聘网页已打开，并刷新页面后重试',
+      };
+    }
+
+    const fields = available.flatMap(scan => scan.fields.map(field => ({
+      ...field,
+      id: buildPanelFieldId(scan.frameId, field.id),
+      frameId: scan.frameId,
+    })));
+    const unmatched = available.flatMap(scan => scan.unmatched.map(item => ({
+      ...item,
+      id: buildPanelFieldId(scan.frameId, item.id),
+      frameId: scan.frameId,
+    })));
+
+    return {
+      success: true,
+      data: {
+        fields,
+        unmatched,
+        detected: available.reduce((total, scan) => total + scan.detected, 0),
+        blockedCount: available.reduce((total, scan) => total + scan.blockedCount, 0),
+        frames: available.map(scan => ({
+          frameId: scan.frameId,
+          detected: scan.detected,
+          blockedCount: scan.blockedCount,
+        })),
+        scannedAt: new Date().toISOString(),
+        topFrameUrl: tab?.url || '',
+      },
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : '扫描本页字段失败',
+    };
+  }
+}
+
+async function requestPanelFrameFill(
+  tabId: number,
+  frameId: number,
+  localIds: string[],
+  allowAutoAddRows: boolean,
+): Promise<PanelFrameFillResult | null> {
+  try {
+    const response = await chrome.tabs.sendMessage(
+      tabId,
+      {
+        type: 'PANEL_FRAME_FILL',
+        payload: { localIds, allowAutoAddRows },
+      } satisfies Message,
+      { frameId },
+    ) as MessageResponse<PanelFrameFillResult> | undefined;
+    if (!response?.success || !response.data) return null;
+    const data = response.data;
+    return {
+      frameId,
+      results: Array.isArray(data.results) ? data.results : [],
+      attempted: Number(data.attempted) || 0,
+      filled: Number(data.filled) || 0,
+      failed: Number(data.failed) || 0,
+      skippedExisting: Number(data.skippedExisting) || 0,
+      skippedBlocked: Number(data.skippedBlocked) || 0,
+      skippedAmbiguous: Number(data.skippedAmbiguous) || 0,
+      urlBefore: String(data.urlBefore || ''),
+      urlAfter: String(data.urlAfter || ''),
+      urlChanged: data.urlChanged === true,
+      undoAvailable: data.undoAvailable === true,
+      autoAddedRows: Number(data.autoAddedRows) || 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function handlePanelFillSelected(
+  payload: PanelFillSelectedPayload,
+  sender: chrome.runtime.MessageSender,
+): Promise<MessageResponse<PanelFillSummary>> {
+  try {
+    const tabId = await resolvePanelSenderTabId(sender, null);
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (tab?.url && isRestrictedPage(tab.url)) {
+      return { success: false, error: '当前页面不是可访问的招聘网页，无法填充' };
+    }
+
+    const requested = Array.isArray(payload?.fieldIds)
+      ? payload.fieldIds.filter((fieldId): fieldId is string => typeof fieldId === 'string')
+      : [];
+    if (requested.length === 0) return { success: false, error: '没有勾选任何字段' };
+    if (requested.length > PANEL_MAX_SELECTED_FIELDS) {
+      return {
+        success: false,
+        error: `一次最多填充 ${PANEL_MAX_SELECTED_FIELDS} 个字段，请分批勾选`,
+      };
+    }
+
+    const grouped = new Map<number, string[]>();
+    const invalidIds: string[] = [];
+    for (const fieldId of requested) {
+      const parsed = parsePanelFieldId(fieldId);
+      if (!parsed) {
+        invalidIds.push(fieldId);
+        continue;
+      }
+      const current = grouped.get(parsed.frameId) || [];
+      current.push(parsed.localId);
+      grouped.set(parsed.frameId, current);
+    }
+
+    const allowAutoAddRows = payload?.options?.allowAutoAddRows === true
+      || payload?.allowAutoAddRows === true;
+    const frameIds = (await discoverPageReportFrameIds(tabId)).sort((a, b) => a - b);
+    const targetFrameIds = frameIds.filter(frameId => grouped.has(frameId));
+    const responses = await Promise.all(targetFrameIds.map(async frameId => ({
+      frameId,
+      result: await requestPanelFrameFill(
+        tabId,
+        frameId,
+        grouped.get(frameId) || [],
+        allowAutoAddRows,
+      ),
+    })));
+
+    const summary: PanelFillSummary = {
+      results: [],
+      attempted: 0,
+      filled: 0,
+      failed: 0,
+      skippedExisting: 0,
+      skippedBlocked: 0,
+      skippedAmbiguous: 0,
+      notFound: 0,
+      urlChanged: false,
+      undoAvailable: false,
+      autoAddedRows: 0,
+      frames: [],
+    };
+
+    for (const { frameId, result } of responses) {
+      if (!result) {
+        summary.frames.push({ frameId, urlChanged: false, error: '该嵌入页没有响应，已跳过' });
+        continue;
+      }
+      summary.frames.push({ frameId, urlChanged: result.urlChanged });
+      for (const item of result.results) {
+        summary.results.push({
+          fieldId: buildPanelFieldId(frameId, item.localId),
+          localId: item.localId,
+          frameId,
+          outcome: item.outcome,
+          ...(item.message ? { message: item.message } : {}),
+        });
+      }
+      summary.attempted += result.attempted;
+      summary.filled += result.filled;
+      summary.failed += result.failed;
+      summary.skippedExisting += result.skippedExisting;
+      summary.skippedBlocked += result.skippedBlocked;
+      summary.skippedAmbiguous += result.skippedAmbiguous;
+      summary.urlChanged = summary.urlChanged || result.urlChanged;
+      summary.undoAvailable = summary.undoAvailable || result.undoAvailable;
+      summary.autoAddedRows += result.autoAddedRows;
+    }
+
+    // 已卸载 / 未响应的 frame 以及无效 id：明确报告“未找到”，不静默丢失。
+    for (const [frameId, localIds] of grouped.entries()) {
+      if (frameIds.includes(frameId)) continue;
+      for (const localId of localIds) {
+        summary.results.push({
+          fieldId: buildPanelFieldId(frameId, localId),
+          localId,
+          frameId,
+          outcome: 'not-found',
+          message: '嵌入页已卸载，字段未找到',
+        });
+      }
+    }
+    for (const fieldId of invalidIds) {
+      summary.results.push({
+        fieldId,
+        localId: '',
+        frameId: -1,
+        outcome: 'not-found',
+        message: '字段 id 无效',
+      });
+    }
+    summary.notFound = summary.results.filter(item => item.outcome === 'not-found').length;
+
+    return { success: true, data: summary };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : '填充所选字段失败',
+    };
+  }
+}
+
+async function requestPanelFrameUndo(
+  tabId: number,
+  frameId: number,
+): Promise<PanelFrameUndoResult | null> {
+  try {
+    const response = await chrome.tabs.sendMessage(
+      tabId,
+      { type: 'PANEL_FRAME_UNDO' } satisfies Message,
+      { frameId },
+    ) as MessageResponse<PanelFrameUndoResult> | undefined;
+    if (!response?.success || !response.data) return null;
+    const data = response.data;
+    return {
+      frameId,
+      restored: Number(data.restored) || 0,
+      skipped: Number(data.skipped) || 0,
+      failed: Number(data.failed) || 0,
+      entries: Array.isArray(data.entries) ? data.entries : [],
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function handlePanelUndo(
+  sender: chrome.runtime.MessageSender,
+): Promise<MessageResponse<PanelUndoResult>> {
+  try {
+    const tabId = await resolvePanelSenderTabId(sender, null);
+    const frameIds = (await discoverPageReportFrameIds(tabId)).sort((a, b) => a - b);
+    if (frameIds.length === 0) {
+      return { success: false, error: '找不到可撤销的页面' };
+    }
+    const responses = await Promise.all(frameIds.map(async frameId => ({
+      frameId,
+      result: await requestPanelFrameUndo(tabId, frameId),
+    })));
+
+    const result: PanelUndoResult = {
+      restored: 0,
+      skipped: 0,
+      failed: 0,
+      entries: [],
+      frames: [],
+    };
+    for (const { frameId, result: frameResult } of responses) {
+      if (!frameResult) {
+        result.frames.push({ frameId, restored: 0, skipped: 0, failed: 0, error: '该嵌入页没有响应' });
+        continue;
+      }
+      result.frames.push({
+        frameId,
+        restored: frameResult.restored,
+        skipped: frameResult.skipped,
+        failed: frameResult.failed,
+      });
+      for (const entry of frameResult.entries) {
+        result.entries.push({
+          ...(entry.localId
+            ? { localId: entry.localId, fieldId: buildPanelFieldId(frameId, entry.localId) }
+            : {}),
+          frameId,
+          outcome: entry.outcome,
+          ...(entry.message ? { message: entry.message } : {}),
+        });
+      }
+      result.restored += frameResult.restored;
+      result.skipped += frameResult.skipped;
+      result.failed += frameResult.failed;
+    }
+    return { success: true, data: result };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : '撤销填充失败',
+    };
+  }
+}
+
+async function handleOpenPopupTab(): Promise<MessageResponse> {
+  try {
+    await chrome.tabs.create({ url: chrome.runtime.getURL('src/popup/index.html') });
+    return { success: true };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : '无法打开扩展页面',
+    };
+  }
+}
+
+// —— 工具栏图标：打开/关闭页面内悬浮面板（fallback：注入 content.js → 选项页） ——
+
+async function tryTogglePanel(tabId: number): Promise<boolean> {
+  try {
+    const response = await chrome.tabs.sendMessage(
+      tabId,
+      { type: 'PANEL_TOGGLE' } satisfies Message,
+      { frameId: 0 },
+    ) as MessageResponse<{ visible: boolean }> | undefined;
+    return Boolean(response?.success);
+  } catch {
+    return false;
+  }
+}
+
+async function openOptionsPageSafely(reason: string): Promise<void> {
+  console.warn(`[校招表单助手] ${reason}，改为打开设置页`);
+  try {
+    await chrome.runtime.openOptionsPage();
+  } catch (error) {
+    console.warn('[校招表单助手] 打开设置页也失败:', error);
+  }
+}
+
+async function handleActionClicked(tab: chrome.tabs.Tab): Promise<void> {
+  const tabId = tab?.id;
+  if (!tabId) {
+    await openOptionsPageSafely('无法获取当前标签页');
+    return;
+  }
+  const url = tab.url || '';
+  if (isRestrictedPage(url)) {
+    // 浏览器内置页/扩展商店页无法注入面板，按约定回退到设置页（不静默失败）。
+    await openOptionsPageSafely('当前页面不支持页面内面板');
+    return;
+  }
+
+  if (await tryTogglePanel(tabId)) return;
+
+  // 内容脚本未注入（页面在扩展安装前已打开等）：先注入 content.js，再重试。
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [0] },
+      files: ['content.js'],
+    });
+  } catch (error) {
+    console.warn('[校招表单助手] 注入页面面板脚本失败:', error);
+    await openOptionsPageSafely('无法在当前页面注入面板');
+    return;
+  }
+
+  if (await tryTogglePanel(tabId)) return;
+  await openOptionsPageSafely('页面面板无响应');
+}
+
+try {
+  if (chrome.action?.onClicked?.addListener) {
+    chrome.action.onClicked.addListener(tab => {
+      void handleActionClicked(tab);
+    });
+  }
+} catch (error) {
+  // 单测/旧版运行时可能没有 chrome.action：记录但不影响消息处理注册。
+  console.warn('无法注册工具栏图标点击处理:', error);
 }
 
 // —— “记住一次”：把网页字段标题写入当前活动简历的 fieldAliasOverrides ——

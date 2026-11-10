@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "校招表单助手",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "minimum_chrome_version": "116",
   "description": "本地识别并填写校招网申表单：只填空白项、不覆盖已有内容、不提交；资料只保存在本机浏览器。",
   "permissions": [
@@ -23,7 +23,7 @@
     "128": "icons/icon128.png"
   },
   "action": {
-    "default_popup": "src/popup/index.html",
+    "default_title": "校招表单助手（打开/关闭页面面板）",
     "default_icon": {
       "16": "icons/icon16.png",
       "32": "icons/icon32.png",

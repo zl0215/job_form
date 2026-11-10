@@ -1,13 +1,14 @@
 import { FormDetector } from './formDetector';
-import { FormFiller, type FillSection, type FormFillResult } from './formFiller';
+import { FormFiller, type FillSection, type FormFillResult, type FillPlanField } from './formFiller';
 import { collectFormControls } from './domControls.ts';
 import { OpenQuestionDetector } from './openQuestionDetector';
 import { groupPageScanFields, type PageScanField, type PageScanSection } from './pageScan';
 import { extractApplicationPageMetadata } from './applicationRecordMetadata.ts';
 import { createVisualRegionFillController } from './visualRegionFill.ts';
+import { createPanel, PANEL_HOST_ID } from './panel.ts';
 import { FieldMatcher } from '../utils/fieldMatcher';
 import { matchBlockedField } from '../shared/blockedFields.ts';
-import { isControlBlank } from './controlState.ts';
+import { isControlBlank, type FillControl } from './controlState.ts';
 import type {
   DetectedField,
   FocusedFieldWriteResult,
@@ -15,6 +16,16 @@ import type {
   MessageResponse,
   PageFieldReportItem,
   PageFrameFieldReport,
+  PanelField,
+  PanelFieldStatus,
+  PanelFillOutcome,
+  PanelFillSummary,
+  PanelFrameFillResult,
+  PanelFrameScan,
+  PanelFrameUndoResult,
+  PanelScanResult,
+  PanelSection,
+  PanelUndoResult,
   UserProfile,
 } from '../shared/types';
 import { FieldType } from '../shared/types';
@@ -56,6 +67,30 @@ const visualRegionFillController = createVisualRegionFillController({
     shouldContinue,
   ),
 });
+
+// v1.1：网页内悬浮面板只在顶层 frame 渲染；子 frame 只提供扫描/填充/撤销能力。
+const floatingPanel = window === window.top
+  ? createPanel({
+    scan: () => sendRuntimeMessage<PanelScanResult>({ type: 'PANEL_SCAN' }),
+    fillSelected: (fieldIds, options) => sendRuntimeMessage<PanelFillSummary>({
+      type: 'PANEL_FILL_SELECTED',
+      payload: { fieldIds, options: { allowAutoAddRows: options.allowAutoAddRows } },
+    }),
+    undo: () => sendRuntimeMessage<PanelUndoResult>({ type: 'PANEL_UNDO' }),
+    openOptions: () => {
+      void sendRuntimeMessage({ type: 'PANEL_OPEN_OPTIONS' });
+    },
+    openPopup: () => {
+      void sendRuntimeMessage({ type: 'PANEL_OPEN_POPUP' });
+    },
+  })
+  : null;
+
+// 面板本 frame 的字段注册表：localId -> 元素 + 指纹（页面重渲染后按指纹找回）。
+let panelScanRegistry = new Map<string, { element: FillControl; fingerprint: string }>();
+// 本次面板填充写入的元素 -> localId（撤销结果映射回面板行）。
+let panelFillLocalIds = new Map<FillControl, string>();
+
 let detectedFields: DetectedField[] = [];
 let lastFocusedControl:
   | HTMLInputElement
@@ -63,8 +98,20 @@ let lastFocusedControl:
   | HTMLSelectElement
   | null = null;
 
+/** 面板自身注入的控件（Shadow DOM 内）不得被当作页面字段/焦点目标。 */
+function isFloatingPanelControl(target: EventTarget | null): boolean {
+  if (typeof Element === 'undefined' || !(target instanceof Element)) return false;
+  try {
+    const root = target.getRootNode();
+    return root instanceof ShadowRoot && (root.host as HTMLElement | null)?.id === PANEL_HOST_ID;
+  } catch {
+    return false;
+  }
+}
+
 document.addEventListener('focusin', (event) => {
   const target = event.target;
+  if (isFloatingPanelControl(target)) return;
   if (isWritableControl(target)) {
     lastFocusedControl = target;
   }
@@ -245,6 +292,7 @@ async function handleAIPageFill() {
 }
 
 async function fillSection(section: FillSection): Promise<FormFillResult> {
+  const hrefBefore = window.location.href;
   try {
     // 获取用户资料
     const response = await sendRuntimeMessage<UserProfile>({
@@ -257,8 +305,12 @@ async function fillSection(section: FillSection): Promise<FormFillResult> {
     }
 
     // 先补足需要点击“添加”才会出现的动态经历行，再重新检测字段。
+    // 安全模式（默认）：不点“添加/没有实习经历”，避免站点默认提交造成刷新。
     // 统一候选参与同一次检测：精确别名层先于内置规则（方案 §6 / §12.10）。
-    await formFiller.prepareDynamicSections(response.data, section);
+    const prepareResult = await formFiller.prepareDynamicSections(response.data, section);
+    if (prepareResult.navigationDetected) {
+      console.warn('[校招表单助手] 自动补齐经历行时检测到页面地址变化，已停止后续自动点击（未输出个人资料值）');
+    }
     detectedFields = formDetector.detectFields({
       candidates: buildProfileAnswerCandidates(response.data, response.data.fieldAliasOverrides),
       aliasOverrides: response.data.fieldAliasOverrides,
@@ -328,6 +380,12 @@ async function fillSection(section: FillSection): Promise<FormFillResult> {
     }
 
     // 只把写入后回读成功的控件计为成功。
+    const urlChanged = window.location.href !== hrefBefore;
+    if (urlChanged) {
+      // 只记录地址变化事实，不输出任何个人资料值；扩展绝不主动 reload/submit。
+      console.warn('[校招表单助手] 填充期间检测到页面地址变化（未输出个人资料值），本次填充可能被站点打断');
+    }
+    result.urlChanged = urlChanged;
     if (window === window.top) showFillResultMessage(result);
     return result;
 
@@ -954,7 +1012,7 @@ function showFillResultMessage(result: FormFillResult) {
     top: 20px;
     right: 20px;
     z-index: 1000000;
-    background: ${result.filled > 0 && result.failed === 0 ? '#10b981' : '#a16207'};
+    background: ${result.urlChanged ? '#a16207' : result.filled > 0 && result.failed === 0 ? '#10b981' : '#a16207'};
     color: white;
     padding: 16px 24px;
     border-radius: 12px;
@@ -979,7 +1037,9 @@ function showFillResultMessage(result: FormFillResult) {
   const resultText = parts.length
     ? parts.join('；')
     : (result.detected === 0 ? '未检测到可填充字段' : '检测到了字段，但没有可自动填写的空白项');
-  message.textContent = resultText;
+  message.textContent = result.urlChanged
+    ? `检测到页面跳转/刷新，填充可能被站点打断；${resultText}`
+    : resultText;
 
   document.body.appendChild(message);
 
@@ -996,7 +1056,9 @@ function countSkippedChoiceGroups(): number {
     control instanceof HTMLInputElement
     && (control.type === 'radio' || control.type === 'checkbox')
     && control.offsetParent !== null
-    && !control.disabled,
+    && !control.disabled
+    // 扩展自己的悬浮面板（Shadow DOM）里的勾选框不算页面选项。
+    && !isFloatingPanelControl(control),
   );
   const groups = new Set(visibleChoices.map(choice =>
     choice.name
@@ -1004,6 +1066,306 @@ function countSkippedChoiceGroups(): number {
       || choice.id,
   ));
   return groups.size;
+}
+
+// —— 悬浮面板：单 frame 扫描 / 选择性填充 / 撤销（由 background 按 frame 路由） ——
+
+const PANEL_PLANNED_VALUE_MAX_LENGTH = 500;
+const PANEL_SENSITIVE_LABEL_PATTERN = /身份证|证件|手机|电话|邮箱|微信|紧急联系|银行卡/;
+
+function panelFrameFieldStatus(
+  field: DetectedField,
+  planField: FillPlanField | undefined,
+): PanelFieldStatus {
+  if (field.blocked || planField?.status === 'blocked') return 'blocked';
+  if (field.ambiguous || planField?.status === 'ambiguous') return 'ambiguous';
+  if (planField?.status === 'planned') return 'blank';
+  if (planField?.status === 'existing' || !isControlBlank(field.element)) return 'filled';
+  return 'unmatched';
+}
+
+/**
+ * 字段指纹：模块 + 字段类型 + 规范化标题 + 同指纹出现序号。
+ * 面板扫描后页面重渲染时，用它在最新检测结果里找回原字段。
+ */
+function buildPanelFingerprint(
+  section: PanelSection,
+  fieldType: string,
+  label: string,
+  counters: Map<string, number>,
+): string {
+  const base = `${section}|${fieldType}|${normalizeReportText(label, 40)}`;
+  const occurrence = counters.get(base) ?? 0;
+  counters.set(base, occurrence + 1);
+  return `${base}|${occurrence}`;
+}
+
+async function buildPanelFrameScan(): Promise<MessageResponse<PanelFrameScan>> {
+  const profileResponse = await sendRuntimeMessage<UserProfile>({ type: 'GET_USER_PROFILE' });
+  if (!profileResponse.success || !profileResponse.data) {
+    return { success: false, error: '请先在设置中完善个人信息后再使用页面面板' };
+  }
+  const profile = profileResponse.data;
+  const candidates = buildProfileAnswerCandidates(profile, profile.fieldAliasOverrides);
+  detectedFields = formDetector.detectFields({
+    candidates,
+    aliasOverrides: profile.fieldAliasOverrides,
+  });
+  const plan = formFiller.resolvePlan(detectedFields, profile, candidates);
+
+  panelScanRegistry = new Map();
+  panelFillLocalIds = new Map();
+  const fingerprintCounters = new Map<string, number>();
+
+  const fields: PanelField[] = detectedFields.map((field, index) => {
+    const localId = `f${index}`;
+    const element = field.element as FillControl;
+    const planField = plan.byElement.get(element);
+    const label = reportFieldLabel(FieldMatcher.extractIdentifiers(field.element));
+    const section = toPageScanSection(getElementSection(field.element));
+    const status = panelFrameFieldStatus(field, planField);
+    const blankNow = isControlBlank(field.element);
+    const plannedValue = (planField?.value ?? '').slice(0, PANEL_PLANNED_VALUE_MAX_LENGTH);
+    const sensitive = planField?.sensitive === true
+      || PANEL_SENSITIVE_LABEL_PATTERN.test(`${label} ${planField?.profileLabel || ''}`);
+    const fingerprint = buildPanelFingerprint(
+      section,
+      planField?.fieldType || field.fieldType,
+      label,
+      fingerprintCounters,
+    );
+    panelScanRegistry.set(localId, { element, fingerprint });
+    return {
+      id: localId,
+      frameId: 0,
+      label,
+      section,
+      sectionName: getPageSectionName(section),
+      type: describeControlType(field.element),
+      status,
+      blank: blankNow,
+      currentValuePresent: !blankNow,
+      plannedValue,
+      profileLabel: planField?.profileLabel || '',
+      sensitive,
+      writable: status === 'blank' && Boolean(plannedValue.trim()),
+    };
+  });
+
+  const unmatched = formDetector.getUnmatchedFields().map((item, index) => {
+    const section = toPageScanSection(getElementSection(item.element));
+    return {
+      id: `u${index}`,
+      frameId: 0,
+      label: reportFieldLabel(item.identifiers),
+      section,
+      sectionName: getPageSectionName(section),
+      type: describeControlType(item.element),
+      reason: normalizeReportText(item.reason || '未识别', 80),
+      blank: isControlBlank(item.element),
+    };
+  });
+
+  return {
+    success: true,
+    data: {
+      frameId: 0,
+      fields,
+      unmatched,
+      detected: detectedFields.length,
+      blockedCount: detectedFields.filter(field => field.blocked).length,
+    },
+  };
+}
+
+function toPanelFillOutcome(
+  detail: { outcome: string } | undefined,
+): { outcome: PanelFillOutcome; message?: string } {
+  switch (detail?.outcome) {
+    case 'filled':
+    case 'failed':
+    case 'skipped-existing':
+    case 'blocked':
+    case 'ambiguous':
+      return { outcome: detail.outcome as PanelFillOutcome };
+    default:
+      return {
+        outcome: 'ambiguous',
+        message: '没有可写入的计划值（资料缺失或页面选项不匹配）',
+      };
+  }
+}
+
+async function fillPanelFrame(
+  payload: { localIds: string[]; allowAutoAddRows?: boolean },
+): Promise<MessageResponse<PanelFrameFillResult>> {
+  const profileResponse = await sendRuntimeMessage<UserProfile>({ type: 'GET_USER_PROFILE' });
+  if (!profileResponse.success || !profileResponse.data) {
+    return { success: false, error: '请先在设置中完善个人信息后再填充' };
+  }
+  const profile = profileResponse.data;
+  const candidates = buildProfileAnswerCandidates(profile, profile.fieldAliasOverrides);
+  const requestedLocalIds = Array.isArray(payload?.localIds)
+    ? payload.localIds.filter((localId): localId is string => typeof localId === 'string')
+    : [];
+  if (requestedLocalIds.length === 0) {
+    return { success: false, error: '没有勾选任何字段' };
+  }
+  const allowAutoAddRows = payload?.allowAutoAddRows === true;
+  const urlBefore = window.location.href;
+  const prepareResult = await formFiller.prepareDynamicSections(profile, 'all', {
+    allowAutoAddRows,
+  });
+
+  if (prepareResult.navigationDetected) {
+    return {
+      success: true,
+      data: {
+        frameId: 0,
+        results: requestedLocalIds.map(localId => ({
+          localId,
+          outcome: 'not-found' as const,
+          message: '自动补齐经历行时页面发生跳转，已停止填充',
+        })),
+        attempted: 0,
+        filled: 0,
+        failed: 0,
+        skippedExisting: 0,
+        skippedBlocked: 0,
+        skippedAmbiguous: 0,
+        urlBefore,
+        urlAfter: window.location.href,
+        urlChanged: true,
+        undoAvailable: formFiller.hasPendingUndo(),
+        autoAddedRows: prepareResult.clickedAdds,
+      },
+    };
+  }
+
+  detectedFields = formDetector.detectFields({
+    candidates,
+    aliasOverrides: profile.fieldAliasOverrides,
+  });
+  const plan = formFiller.resolvePlan(detectedFields, profile, candidates);
+
+  // 指纹 -> 最新检测到的元素（同一指纹可能有多个，按顺序取未使用项）。
+  const fingerprintCounters = new Map<string, number>();
+  const fingerprintToElements = new Map<string, FillControl[]>();
+  for (const field of detectedFields) {
+    const element = field.element as FillControl;
+    const planField = plan.byElement.get(element);
+    if (!planField) continue;
+    const label = reportFieldLabel(FieldMatcher.extractIdentifiers(field.element));
+    const section = toPageScanSection(getElementSection(field.element));
+    const fingerprint = buildPanelFingerprint(
+      section,
+      planField.fieldType,
+      label,
+      fingerprintCounters,
+    );
+    const bucket = fingerprintToElements.get(fingerprint) || [];
+    bucket.push(element);
+    fingerprintToElements.set(fingerprint, bucket);
+  }
+
+  const used = new Set<FillControl>();
+  const selectedElements: FillControl[] = [];
+  const results: Array<{ localId: string; outcome: PanelFillOutcome; message?: string }> = [];
+  for (const localId of requestedLocalIds) {
+    const registryEntry = panelScanRegistry.get(localId);
+    let element: FillControl | null = null;
+    if (registryEntry) {
+      if (plan.byElement.has(registryEntry.element)) {
+        element = registryEntry.element;
+      } else {
+        // 页面重渲染后旧节点脱离文档：按指纹找回同名字段（多个同指纹按顺序取未使用项）。
+        const bucket = (fingerprintToElements.get(registryEntry.fingerprint) || [])
+          .filter(candidate => !used.has(candidate));
+        if (bucket.length > 0) element = bucket[0];
+      }
+    }
+    if (!element) {
+      results.push({
+        localId,
+        outcome: 'not-found',
+        message: '页面已变化，未找到该字段，请重新扫描',
+      });
+      continue;
+    }
+    used.add(element);
+    selectedElements.push(element);
+    panelFillLocalIds.set(element, localId);
+  }
+
+  const execution = await formFiller.fillPlanSelected(
+    plan,
+    selectedElements,
+    detectedFields.length,
+    { captureUndo: true },
+  );
+  const detailByElement = new Map(execution.details.map(detail => [detail.element, detail]));
+  for (const element of selectedElements) {
+    const localId = panelFillLocalIds.get(element) || '';
+    const mapped = toPanelFillOutcome(detailByElement.get(element));
+    results.push({ localId, outcome: mapped.outcome, ...(mapped.message ? { message: mapped.message } : {}) });
+  }
+
+  const urlAfter = window.location.href;
+  const urlChanged = urlAfter !== urlBefore;
+  if (urlChanged) {
+    console.warn('[校招表单助手] 面板填充期间检测到页面地址变化（未输出个人资料值），填充可能被站点打断');
+  }
+
+  return {
+    success: true,
+    data: {
+      frameId: 0,
+      results,
+      attempted: execution.result.attempted,
+      filled: execution.result.filled,
+      failed: execution.result.failed,
+      skippedExisting: execution.result.skippedExisting || 0,
+      skippedBlocked: execution.result.skippedBlocked || 0,
+      skippedAmbiguous: execution.result.skippedAmbiguous || 0,
+      urlBefore,
+      urlAfter,
+      urlChanged,
+      undoAvailable: formFiller.hasPendingUndo(),
+      autoAddedRows: prepareResult.clickedAdds,
+    },
+  };
+}
+
+function findPanelLocalIdForElement(element: FillControl): string | undefined {
+  const direct = panelFillLocalIds.get(element);
+  if (direct) return direct;
+  for (const [localId, entry] of panelScanRegistry) {
+    if (entry.element === element) return localId;
+  }
+  return undefined;
+}
+
+async function undoPanelFrame(): Promise<MessageResponse<PanelFrameUndoResult>> {
+  const restore = await formFiller.undoPendingFill();
+  const entries = restore.entries.map(entry => {
+    const localId = findPanelLocalIdForElement(entry.element);
+    return {
+      ...(localId ? { localId } : {}),
+      outcome: entry.outcome,
+      ...(entry.message ? { message: entry.message } : {}),
+    };
+  });
+  panelFillLocalIds = new Map();
+  return {
+    success: true,
+    data: {
+      frameId: 0,
+      restored: restore.restored,
+      skipped: restore.skipped,
+      failed: restore.failed,
+      entries,
+    },
+  };
 }
 
 // 监听来自 popup 的消息
@@ -1070,6 +1432,52 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({
         success: false,
         error: error instanceof Error ? error.message : '写入目标字段失败',
+      });
+    });
+    return true;
+  }
+
+  // —— 悬浮面板（background 按 frame 路由） ——
+  if (message.type === 'PANEL_TOGGLE') {
+    if (!floatingPanel) {
+      sendResponse({ success: false, error: '页面内面板只在顶层页面显示' });
+      return true;
+    }
+    sendResponse({ success: true, data: floatingPanel.toggle() });
+    return true;
+  }
+
+  if (message.type === 'PANEL_FRAME_SCAN') {
+    buildPanelFrameScan().then((response) => {
+      sendResponse(response);
+    }).catch((error) => {
+      sendResponse({
+        success: false,
+        error: error instanceof Error ? error.message : '扫描本页字段失败',
+      });
+    });
+    return true;
+  }
+
+  if (message.type === 'PANEL_FRAME_FILL') {
+    fillPanelFrame(message.payload).then((response) => {
+      sendResponse(response);
+    }).catch((error) => {
+      sendResponse({
+        success: false,
+        error: error instanceof Error ? error.message : '填充所选字段失败',
+      });
+    });
+    return true;
+  }
+
+  if (message.type === 'PANEL_FRAME_UNDO') {
+    undoPanelFrame().then((response) => {
+      sendResponse(response);
+    }).catch((error) => {
+      sendResponse({
+        success: false,
+        error: error instanceof Error ? error.message : '撤销填充失败',
       });
     });
     return true;

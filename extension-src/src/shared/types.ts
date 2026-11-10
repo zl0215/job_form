@@ -528,7 +528,18 @@ export type Message =
   | { type: 'SYNC_NOW'; payload?: null }
   | { type: 'FORCE_UPLOAD_LOCAL'; payload?: null }
   | { type: 'FORCE_DOWNLOAD_REMOTE'; payload?: null }
-  | { type: 'RESOLVE_SYNC_CONFLICT'; payload: { choice: 'local' | 'remote' } };
+  | { type: 'RESOLVE_SYNC_CONFLICT'; payload: { choice: 'local' | 'remote' } }
+  // v1.1 网页内悬浮面板：扫描 / 选择性填充 / 撤销 / 打开扩展页面。
+  | { type: 'PANEL_SCAN'; payload?: { tabId?: number } | null }
+  | { type: 'PANEL_FILL_SELECTED'; payload: PanelFillSelectedPayload }
+  | { type: 'PANEL_UNDO'; payload?: null }
+  | { type: 'PANEL_OPEN_OPTIONS'; payload?: null }
+  | { type: 'PANEL_OPEN_POPUP'; payload?: null }
+  // background → content（顶层 frame）与 background → 各 frame 的内部消息。
+  | { type: 'PANEL_TOGGLE'; payload?: null }
+  | { type: 'PANEL_FRAME_SCAN'; payload?: { tabId?: number } | null }
+  | { type: 'PANEL_FRAME_FILL'; payload: { localIds: string[]; allowAutoAddRows?: boolean } }
+  | { type: 'PANEL_FRAME_UNDO'; payload?: null };
 
 export interface MessageResponse<T = any> {
   success: boolean;
@@ -627,4 +638,172 @@ export interface ResumeProfileLibrary {
   schemaVersion: 1;
   activeProfileId: string;
   profiles: ResumeProfile[];
+}
+
+// —— v1.1 网页内悬浮面板（字段勾选 / 预览 / 选择性填充 / 撤销） ——
+// 全部为 JSON 可序列化结构：面板在顶层 frame，扫描/填充经 background 按 frame 路由。
+
+export type PanelSection = 'personal' | 'education' | 'experience' | 'projects' | 'awards' | 'other';
+
+/** 字段在面板中的状态。blank=空白且计划值可填；filled=已有内容不会覆盖。 */
+export type PanelFieldStatus = 'blank' | 'filled' | 'blocked' | 'ambiguous' | 'unmatched';
+
+export interface PanelField {
+  /** 跨 frame 唯一 id：`frame-<frameId>:<localId>`（顶层 frameId 为 0）。 */
+  id: string;
+  frameId: number;
+  /** 页面可见字段标题（可能为空，面板会回退到占位符/name）。 */
+  label: string;
+  section: PanelSection;
+  /** 模块中文名（基本信息 / 教育经历 / …）。 */
+  sectionName: string;
+  /** 控件类型描述（text / select / textarea / combobox …）。 */
+  type: string;
+  status: PanelFieldStatus;
+  blank: boolean;
+  /** 控件当前是否已有内容（= !blank，显式提供便于跨端消费）。 */
+  currentValuePresent: boolean;
+  /** 将要填入的值（来自当前简历资料）；null/空表示没有计划值。 */
+  plannedValue: string;
+  /** 命中的资料字段名称（如“本人手机号”）；空表示未知。 */
+  profileLabel: string;
+  /** 敏感字段：面板默认遮罩显示，行内可临时显示明文。 */
+  sensitive: boolean;
+  /** 可勾选填充：空白 + 有计划值 + 非禁止/冲突。 */
+  writable: boolean;
+}
+
+export interface PanelUnmatchedField {
+  id: string;
+  frameId: number;
+  label: string;
+  section: PanelSection;
+  sectionName: string;
+  type: string;
+  reason: string;
+  blank: boolean;
+}
+
+/** 单个 frame 的扫描结果（content → background）。 */
+export interface PanelFrameScan {
+  frameId: number;
+  fields: PanelField[];
+  unmatched: PanelUnmatchedField[];
+  detected: number;
+  blockedCount: number;
+}
+
+export interface PanelFrameScanSummary {
+  frameId: number;
+  detected: number;
+  blockedCount: number;
+}
+
+/** 汇总所有 frame 的扫描结果（background → 面板）。 */
+export interface PanelScanResult {
+  fields: PanelField[];
+  unmatched: PanelUnmatchedField[];
+  detected: number;
+  blockedCount: number;
+  frames: PanelFrameScanSummary[];
+  scannedAt: string;
+  topFrameUrl: string;
+}
+
+/** 面板内“安全模式”开关，持久化在 chrome.storage.local。 */
+export interface PanelSettings {
+  /** 自动补齐经历行（点击页面“添加/没有实习经历”）：默认关闭。 */
+  allowAutoAddRows: boolean;
+  /** 敏感字段值默认遮罩：默认开启。 */
+  maskSensitive: boolean;
+}
+
+/** 面板位置/折叠状态，持久化在 chrome.storage.local。 */
+export interface PanelLayout {
+  left?: number;
+  top?: number;
+  collapsed: boolean;
+}
+
+/** 面板选择性填充请求（content → background）。 */
+export interface PanelFillSelectedPayload {
+  fieldIds: string[];
+  /** 兼容两种写法：顶层 allowAutoAddRows 或 options.allowAutoAddRows。 */
+  allowAutoAddRows?: boolean;
+  options?: { allowAutoAddRows?: boolean };
+}
+
+export type PanelFillOutcome =
+  | 'filled'
+  | 'skipped-existing'
+  | 'blocked'
+  | 'ambiguous'
+  | 'failed'
+  | 'not-found';
+
+export interface PanelFieldFillResult {
+  fieldId: string;
+  localId: string;
+  frameId: number;
+  outcome: PanelFillOutcome;
+  message?: string;
+}
+
+/** 单个 frame 的选择性填充结果（content → background）。 */
+export interface PanelFrameFillResult {
+  frameId: number;
+  results: Array<{ localId: string; outcome: PanelFillOutcome; message?: string }>;
+  attempted: number;
+  filled: number;
+  failed: number;
+  skippedExisting: number;
+  skippedBlocked: number;
+  skippedAmbiguous: number;
+  urlBefore: string;
+  urlAfter: string;
+  urlChanged: boolean;
+  undoAvailable: boolean;
+  autoAddedRows: number;
+}
+
+/** 汇总所有 frame 的填充结果（background → 面板）。 */
+export interface PanelFillSummary {
+  results: PanelFieldFillResult[];
+  attempted: number;
+  filled: number;
+  failed: number;
+  skippedExisting: number;
+  skippedBlocked: number;
+  skippedAmbiguous: number;
+  notFound: number;
+  urlChanged: boolean;
+  undoAvailable: boolean;
+  autoAddedRows: number;
+  frames: Array<{ frameId: number; urlChanged: boolean; error?: string }>;
+}
+
+export type PanelUndoOutcome = 'restored' | 'skipped' | 'failed';
+
+/** 单个 frame 的撤销结果（content → background）。 */
+export interface PanelFrameUndoResult {
+  frameId: number;
+  restored: number;
+  skipped: number;
+  failed: number;
+  entries: Array<{ localId?: string; outcome: PanelUndoOutcome; message?: string }>;
+}
+
+/** 汇总所有 frame 的撤销结果（background → 面板）。 */
+export interface PanelUndoResult {
+  restored: number;
+  skipped: number;
+  failed: number;
+  entries: Array<{
+    fieldId?: string;
+    localId?: string;
+    frameId: number;
+    outcome: PanelUndoOutcome;
+    message?: string;
+  }>;
+  frames: Array<{ frameId: number; restored: number; skipped: number; failed: number; error?: string }>;
 }
