@@ -519,6 +519,8 @@ export type Message =
   | { type: 'SAVE_LLM_CONFIG'; payload: LLMConfig }
   | { type: 'TEST_LLM_CONNECTION'; payload?: LLMConfig | null }
   | { type: 'EXPORT_BACKUP'; payload?: null }
+  // 只返回 JSON 字符串、不触发下载；用于跨浏览器剪贴板/共享文件写入。
+  | { type: 'EXPORT_BACKUP_JSON'; payload?: { includeWebDAVConfig?: boolean } | null }
   | { type: 'PREVIEW_BACKUP_IMPORT'; payload: { json: string } }
   | { type: 'IMPORT_BACKUP'; payload: { json: string } }
   | { type: 'GET_WEBDAV_CONFIG'; payload?: null }

@@ -839,6 +839,47 @@ textarea:focus {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+/* 跨浏览器共享：剪贴板快速共享 + 共享文件自动同步 */
+.cross-browser-share {
+  padding-bottom: 32px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.cross-browser-share .share-file-summary {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.share-paste-textarea {
+  min-height: 132px;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  resize: vertical;
+}
+
+.cross-browser-share .share-paste-field {
+  margin-bottom: 12px;
+}
+
+.cross-browser-share .data-notice {
+  margin-top: 14px;
+}
+
+.cross-browser-share .backup-preview .backup-summary {
+  margin-top: 14px;
+}
+
+.cross-browser-share .sync-actions .btn {
+  min-height: 38px;
+  padding: 8px 18px;
+}
+
+@media (max-width: 720px) {
+  .cross-browser-share .share-file-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
 .confirm-layer {
   position: fixed;
   z-index: 20;

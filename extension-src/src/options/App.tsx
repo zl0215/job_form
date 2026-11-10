@@ -18,6 +18,7 @@ import { EducationSection } from './EducationSection';
 import { ExperienceSection } from './ExperienceSection';
 import { AwardsSection } from './AwardsSection';
 import { DataSyncSettings } from './DataSyncSettings';
+import { CrossBrowserShareSection } from './CrossBrowserShareSection';
 import { LegacyImportSection } from './LegacyImportSection';
 import { ApplicationRecordsSection } from './ApplicationRecordsSection';
 import { ResumeProfileManager } from './ResumeProfileManager';
@@ -765,6 +766,7 @@ function App() {
 
           {activeTab === 'data-sync' && (
             <div className="data-sync-tab">
+              <CrossBrowserShareSection onDataChanged={handleExternalDataChange} />
               <DataSyncSettings onDataChanged={handleExternalDataChange} />
               <LegacyImportSection onImported={handleExternalDataChange} />
             </div>

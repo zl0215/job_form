@@ -276,6 +276,9 @@ export async function handleMessage(
     case 'EXPORT_BACKUP':
       return await handleExportBackup();
 
+    case 'EXPORT_BACKUP_JSON':
+      return await handleExportBackupJson(message.payload);
+
     case 'PREVIEW_BACKUP_IMPORT':
       return handlePreviewBackup(message.payload.json);
 
@@ -1475,6 +1478,23 @@ async function handleExportBackup(): Promise<MessageResponse> {
       filename: backupFilename(),
     },
   };
+}
+
+async function handleExportBackupJson(
+  payload?: { includeWebDAVConfig?: boolean } | null,
+): Promise<MessageResponse> {
+  const [data, webdavConfig] = await Promise.all([
+    StorageService.getBackupData(),
+    StorageService.getWebDAVConfig(),
+  ]);
+  // 共享文件默认不携带 WebDAV 凭据：两个浏览器各自保留自己的同步设置。
+  const document = createBackupDocument(
+    data,
+    chrome.runtime.getManifest().version,
+    undefined,
+    payload?.includeWebDAVConfig === false ? undefined : webdavConfig,
+  );
+  return { success: true, data: { json: serializeBackup(document) } };
 }
 
 function handlePreviewBackup(json: string): MessageResponse {
